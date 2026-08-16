@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iris-web</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem;
+         max-width: 1100px; margin-inline: auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+  fieldset { border: 1px solid #8884; border-radius: 8px; margin: 0 0 1.5rem; padding: 1rem; }
+  label { display: block; font-size: .85rem; margin-bottom: .25rem; opacity: .8; }
+  input, select, textarea, button { font: inherit; padding: .5rem;
+         border-radius: 6px; border: 1px solid #8886; background: transparent; color: inherit; }
+  textarea { width: 100%; box-sizing: border-box; resize: vertical; }
+  .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: end; margin-top: .75rem; }
+  .row > div { flex: 1 1 8rem; }
+  button.primary { background: #2b6cb0; color: #fff; border: none; cursor: pointer; padding: .6rem 1.2rem; }
+  button.primary:disabled { opacity: .5; cursor: default; }
+  #drop { border: 2px dashed #8886; border-radius: 8px; padding: .75rem;
+          text-align: center; font-size: .85rem; opacity: .8; cursor: pointer; }
+  #drop.over { border-color: #2b6cb0; }
+  .bar { height: 6px; background: #8883; border-radius: 3px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: #2b6cb0; width: 0; transition: width .4s; }
+  .gallery { display: grid; gap: 1rem;
+             grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+  .card { border: 1px solid #8884; border-radius: 8px; overflow: hidden; }
+  .card img { width: 100%; display: block; background: #8881; }
+  .meta-box { padding: .6rem; font-size: .8rem; }
+  .meta-box p { margin: 0 0 .4rem; }
+  .meta { opacity: .65; font-size: .75rem; }
+  .actions { display: flex; gap: .35rem; margin-top: .5rem; flex-wrap: wrap; }
+  .actions button { font-size: .75rem; padding: .3rem .5rem; cursor: pointer; }
+  .warn { font-size: .75rem; color: #b45309; }
+</style>
+</head>
+<body>
+
+<h1>iris-web</h1>
+
+<fieldset>
+  <legend>New image</legend>
+  <label for="subject">What to generate</label>
+  <textarea id="subject" rows="2" placeholder="a lighthouse in a storm"></textarea>
+
+  <div class="row">
+    <div>
+      <label for="style">Style</label>
+      <select id="style"></select>
+    </div>
+    <div>
+      <label for="size">Size</label>
+      <select id="size">
+        <option value="256">256 — quick try</option>
+        <option value="512" selected>512 — final</option>
+      </select>
+    </div>
+    <div>
+      <label for="seed">Seed (blank = new)</label>
+      <input id="seed" placeholder="e.g. 12345" inputmode="numeric">
+    </div>
+    <div>
+      <button class="primary" id="go">Generate</button>
+    </div>
+  </div>
+
+  <div class="row">
+    <div id="drop">Drop a reference image here (PNG or JPEG) &mdash; or leave empty</div>
+  </div>
+  <p id="error" class="warn"></p>
+</fieldset>
+
+<fieldset>
+  <legend>Working</legend>
+  <div id="queue">nothing running</div>
+</fieldset>
+
+<div class="gallery" id="gallery"></div>
+
+<script>
+// Styles come from the server (/api/stato): one list to keep up to date.
+let currentInput = null;
+let stylesLoaded = false;
+const sel = document.getElementById('style');
+const drop = document.getElementById('drop');
+const DROP_TEXT = 'Drop a reference image here (PNG or JPEG) — or leave empty';
+
+function showError(t) { document.getElementById('error').textContent = t || ''; }
+
+document.getElementById('go').addEventListener('click', async () => {
+  showError('');
+  const body = {
+    soggetto: document.getElementById('subject').value,
+    stile: sel.value,
+    width: +document.getElementById('size').value,
+    height: +document.getElementById('size').value,
+    seed: document.getElementById('seed').value.trim(),
+    input: currentInput,
+  };
+  if (sel.value === 'custom') {
+    body.stile_libero = prompt('Describe the style:') || '';
+  }
+  const r = await fetch('/api/genera', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const d = await r.json();
+  if (!r.ok) return showError(d.error || 'error');
+  document.getElementById('seed').value = '';
+  refresh();
+});
+
+// --- reference image drop ---
+['dragenter','dragover'].forEach(e => drop.addEventListener(e, ev => {
+  ev.preventDefault(); drop.classList.add('over');
+}));
+['dragleave','drop'].forEach(e => drop.addEventListener(e, ev => {
+  ev.preventDefault(); drop.classList.remove('over');
+}));
+drop.addEventListener('drop', async ev => {
+  const file = ev.dataTransfer.files[0];
+  if (!file) return;
+  const r = await fetch('/api/carica', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/octet-stream'},
+    body: await file.arrayBuffer(),
+  });
+  const d = await r.json();
+  if (!r.ok) return showError(d.error || 'upload failed');
+  currentInput = d.nome;
+  drop.textContent = 'reference: ' + d.nome + ' (click to clear)';
+});
+drop.addEventListener('click', () => {
+  currentInput = null;
+  drop.textContent = DROP_TEXT;
+});
+
+// --- gallery ---
+function cardHtml(i) {
+  const repeatable = i.seed !== undefined && i.seed !== null;
+  const p = (i.prompt || '').replace(/</g,'&lt;');
+  return `<div class="card">
+    <img src="/images/${encodeURIComponent(i.file)}" loading="lazy" alt="">
+    <div class="meta-box">
+      <p>${p || '(no prompt)'}</p>
+      <p class="meta">${i.width || '?'}×${i.height || '?'} ·
+         ${repeatable ? 'seed ' + i.seed : '<span class="warn">seed not recorded</span>'} ·
+         ${i.date || ''}</p>
+      <div class="actions">
+        ${repeatable ? `<button onclick="again(${i.seed}, this)" data-p="${encodeURIComponent(i.prompt||'')}">make again</button>
+        <button onclick="vary(this)" data-p="${encodeURIComponent(i.prompt||'')}">vary</button>` : ''}
+        <button onclick="useAsReference('${i.file}')">use as reference</button>
+      </div>
+    </div></div>`;
+}
+
+async function send(prompt, seed) {
+  await fetch('/api/genera', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({soggetto: prompt, stile: 'none',
+                          width: +document.getElementById('size').value,
+                          height: +document.getElementById('size').value,
+                          seed: seed}),
+  });
+  refresh();
+}
+function again(seed, b) { send(decodeURIComponent(b.dataset.p), seed); }
+function vary(b) { send(decodeURIComponent(b.dataset.p), ''); }
+function useAsReference(file) {
+  currentInput = file;
+  drop.textContent = 'reference: ' + file + ' (click to clear)';
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+
+async function refresh() {
+  const d = await (await fetch('/api/stato')).json();
+
+  if (!stylesLoaded && d.stili) {
+    d.stili.forEach(s => sel.add(new Option(s, s)));
+    sel.add(new Option('custom…', 'custom'));
+    stylesLoaded = true;
+  }
+  if (d.ultimo_errore) showError('last generation failed: ' + d.ultimo_errore);
+
+  const q = document.getElementById('queue');
+  if (d.in_corso) {
+    const pc = Math.round((d.in_corso.progresso || 0) * 100);
+    q.innerHTML = `<p>${(d.in_corso.prompt || '').replace(/</g,'&lt;')}</p>
+      <div class="bar"><i style="width:${pc}%"></i></div>
+      <p class="meta">${pc}% · seed ${d.in_corso.seed}</p>` +
+      (d.in_attesa.length ? `<p class="meta">queued: ${d.in_attesa.length}</p>` : '');
+  } else {
+    q.textContent = d.in_attesa.length ? 'queued: ' + d.in_attesa.length : 'nothing running';
+  }
+  document.getElementById('gallery').innerHTML = d.immagini.map(cardHtml).join('');
+}
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

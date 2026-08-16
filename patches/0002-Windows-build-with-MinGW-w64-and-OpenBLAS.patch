@@ -1,0 +1,409 @@
+From 63c48314a81a1a23f631dbfdd452b661df3d9f00 Mon Sep 17 00:00:00 2001
+From: dareus66 <152093015+dareus66@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 10:28:35 +0200
+Subject: [PATCH 2/3] Windows: build with MinGW-w64 and OpenBLAS
+
+Adds a Windows build of the BLAS backend, compiled from an MSYS2 UCRT64
+shell with "make blas". The delta is Linux to Windows rather than macOS
+to Windows, since the OpenBLAS path already exists and every Accelerate
+include is behind __APPLE__.
+
+Four platform shims, all inside #ifdef _WIN32, with the POSIX branches
+left untouched:
+
+- iris_safetensors.c: CreateFileMapping/MapViewOfFile instead of mmap.
+  A mapped view keeps its own references, so the file and mapping
+  handles are closed right after mapping, mirroring the POSIX code that
+  closes the fd after mmap. Release goes through a small iris_unmap()
+  helper, so the struct is unchanged.
+- iris_transformer_flux.c: GetSystemInfo instead of sysconf for the CPU
+  count in get_attn_num_threads(). MinGW ships unistd.h but not sysconf,
+  so this is a hard compile error otherwise. The other two sysconf calls
+  are inside USE_METAL / __APPLE__ branches and never reach this build.
+- terminals.c: the iTerm2 temp-file path returns -1. MinGW has no
+  mkstemps(), and iTerm2 is a macOS terminal that is never detected on
+  Windows, so a shim there would be dead code.
+- Config, tokenizer and index files are opened in binary mode. Windows
+  text mode translates CRLF and would corrupt the sized reads that
+  follow ftell(); on POSIX "rb" is identical to "r".
+
+The interactive REPL is not built on Windows: iris_cli.c, linenoise.c
+and embcache.c need termios. main.c prints an error and exits when
+interactive mode is requested. The only symbol main.c needs from that
+module is iris_cli_run(), so excluding the three files is enough.
+
+Verified on a Xeon W-2125 with flux-klein-4b against the repository's
+own reference images, all well inside the threshold of 20:
+
+  64x64, 2 steps, seed 42      mean_diff 1.14
+  512x512, 4 steps, seed 123   mean_diff 2.12
+  img2img 256x256, seed 456    mean_diff 8.29
+
+Note that run_test.py cannot run unchanged on hardware this slow: it
+kills each test after 300s and the 512x512 case needs more, so those
+three were run by hand. "run_test.py --quick" passes as is.
+
+Also ignores the built binary, which .gitignore still referred to by
+its pre-rename name (flux).
+---
+ .gitignore                |  2 ++
+ Makefile                  | 15 +++++++++
+ iris.c                    |  6 ++--
+ iris_qwen3.c              |  4 +--
+ iris_safetensors.c        | 66 +++++++++++++++++++++++++++++++++++++--
+ iris_transformer_flux.c   | 15 +++++++--
+ iris_transformer_zimage.c |  2 +-
+ main.c                    | 12 +++++++
+ terminals.c               |  7 +++++
+ 9 files changed, 118 insertions(+), 11 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index e665939..5f76e4e 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -3,6 +3,8 @@
+ 
+ # Compiled binaries
+ flux
++iris
++iris.exe
+ 
+ # Model weights (large files)
+ flux-klein-*/
+diff --git a/Makefile b/Makefile
+index 765b771..4a9445c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -13,7 +13,12 @@ UNAME_M := $(shell uname -m)
+ # Source files
+ SRCS = iris.c iris_kernels.c iris_tokenizer.c iris_vae.c iris_transformer_flux.c iris_transformer_zimage.c iris_sample.c iris_image.c jpeg.c iris_safetensors.c iris_qwen3.c iris_qwen3_tokenizer.c terminals.c
+ OBJS = $(SRCS:.c=.o)
++# The interactive REPL needs termios/linenoise: not available on Windows.
++ifneq (,$(filter MINGW% MSYS%,$(UNAME_S)))
++CLI_SRCS =
++else
+ CLI_SRCS = iris_cli.c linenoise.c embcache.c
++endif
+ CLI_OBJS = $(CLI_SRCS:.c=.o)
+ MAIN = main.c
+ TARGET = iris
+@@ -65,9 +70,15 @@ ifeq ($(UNAME_S),Darwin)
+ blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
+ blas: LDFLAGS += -framework Accelerate
+ else
++ifneq (,$(filter MINGW% MSYS%,$(UNAME_S)))
++MINGW_PREFIX ?= /ucrt64
++blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -DIRIS_NO_REPL -I$(MINGW_PREFIX)/include/openblas
++blas: LDFLAGS += -lopenblas
++else
+ blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
+ blas: LDFLAGS += -lopenblas
+ endif
++endif
+ blas: clean $(TARGET)
+ 	@echo ""
+ 	@echo "Built with BLAS backend (~30x faster than generic)"
+@@ -169,9 +180,13 @@ ifeq ($(UNAME_S),Darwin)
+ ifeq ($(UNAME_M),arm64)
+ 	@echo "  mps     - Metal GPU (recommended)"
+ endif
++else
++ifneq (,$(filter MINGW% MSYS%,$(UNAME_S)))
++	@echo "  blas    - OpenBLAS (MSYS2 UCRT64; REPL not built)"
+ else
+ 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
+ endif
++endif
+ 
+ # =============================================================================
+ # Dependencies
+diff --git a/iris.c b/iris.c
+index 310a773..97149f6 100644
+--- a/iris.c
++++ b/iris.c
+@@ -260,7 +260,7 @@ iris_ctx *iris_load_dir(const char *model_dir) {
+     ctx->is_zimage = 0;
+     snprintf(path, sizeof(path), "%s/model_index.json", model_dir);
+     if (file_exists(path)) {
+-        FILE *f = fopen(path, "r");
++        FILE *f = fopen(path, "rb");
+         if (f) {
+             char buf[4096];
+             size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+@@ -284,7 +284,7 @@ iris_ctx *iris_load_dir(const char *model_dir) {
+     ctx->text_dim = 7680;  /* default 4B: 3 * 2560 */
+     snprintf(path, sizeof(path), "%s/transformer/config.json", model_dir);
+     if (file_exists(path)) {
+-        FILE *f = fopen(path, "r");
++        FILE *f = fopen(path, "rb");
+         if (f) {
+             char buf[8192];
+             size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+@@ -390,7 +390,7 @@ iris_ctx *iris_load_dir(const char *model_dir) {
+     ctx->vae_shift = 0.0f;
+     snprintf(path, sizeof(path), "%s/vae/config.json", model_dir);
+     if (file_exists(path)) {
+-        FILE *f = fopen(path, "r");
++        FILE *f = fopen(path, "rb");
+         if (f) {
+             char buf[4096];
+             size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+diff --git a/iris_qwen3.c b/iris_qwen3.c
+index 886e3e1..98b95c4 100644
+--- a/iris_qwen3.c
++++ b/iris_qwen3.c
+@@ -1379,7 +1379,7 @@ static int parse_qwen3_config(const char *model_dir, qwen3_model_t *model) {
+     char path[1024];
+     snprintf(path, sizeof(path), "%s/config.json", model_dir);
+ 
+-    FILE *f = fopen(path, "r");
++    FILE *f = fopen(path, "rb");
+     if (!f) return -1;
+ 
+     char buf[8192];
+@@ -1453,7 +1453,7 @@ static int open_safetensors_shards(const char *model_dir,
+ 
+     /* First try: read the index JSON to discover shard filenames */
+     snprintf(path, sizeof(path), "%s/model.safetensors.index.json", model_dir);
+-    FILE *f = fopen(path, "r");
++    FILE *f = fopen(path, "rb");
+     if (f) {
+         /* Read the whole index file */
+         fseek(f, 0, SEEK_END);
+diff --git a/iris_safetensors.c b/iris_safetensors.c
+index 968a103..5cc87c0 100644
+--- a/iris_safetensors.c
++++ b/iris_safetensors.c
+@@ -6,10 +6,26 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++#else
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
++#endif
++
++/* Release a read-only file mapping created in safetensors_open(). */
++static void iris_unmap(void *data, size_t size) {
++#ifdef _WIN32
++    (void)size;  /* Windows tracks the view size internally */
++    UnmapViewOfFile(data);
++#else
++    munmap(data, size);
++#endif
++}
+ 
+ /* Minimal JSON parser for safetensors header */
+ 
+@@ -205,6 +221,49 @@ static int parse_header(safetensors_file_t *sf) {
+  * OS page in tensor data on demand, avoiding upfront reads of multi-GB model
+  * files -- only the weights actually used get loaded into RAM. */
+ safetensors_file_t *safetensors_open(const char *path) {
++#ifdef _WIN32
++    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
++                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (fh == INVALID_HANDLE_VALUE) {
++        fprintf(stderr, "safetensors_open: cannot open %s (error %lu)\n",
++                path, (unsigned long)GetLastError());
++        return NULL;
++    }
++
++    LARGE_INTEGER fsize;
++    if (!GetFileSizeEx(fh, &fsize)) {
++        fprintf(stderr, "safetensors_open: cannot stat %s (error %lu)\n",
++                path, (unsigned long)GetLastError());
++        CloseHandle(fh);
++        return NULL;
++    }
++
++    size_t file_size = (size_t)fsize.QuadPart;
++    if (file_size < 8) {
++        fprintf(stderr, "safetensors_open: file too small\n");
++        CloseHandle(fh);
++        return NULL;
++    }
++
++    HANDLE mapping = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
++    if (!mapping) {
++        fprintf(stderr, "safetensors_open: CreateFileMapping failed (error %lu)\n",
++                (unsigned long)GetLastError());
++        CloseHandle(fh);
++        return NULL;
++    }
++
++    void *data = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
++    /* The view holds its own references, so both handles can go now. */
++    CloseHandle(mapping);
++    CloseHandle(fh);
++
++    if (!data) {
++        fprintf(stderr, "safetensors_open: MapViewOfFile failed (error %lu)\n",
++                (unsigned long)GetLastError());
++        return NULL;
++    }
++#else
+     int fd = open(path, O_RDONLY);
+     if (fd < 0) {
+         perror("safetensors_open: open failed");
+@@ -232,6 +291,7 @@ safetensors_file_t *safetensors_open(const char *path) {
+         perror("safetensors_open: mmap failed");
+         return NULL;
+     }
++#endif
+ 
+     /* Read header size (8-byte little-endian) */
+     uint64_t header_size = 0;
+@@ -239,13 +299,13 @@ safetensors_file_t *safetensors_open(const char *path) {
+ 
+     if (header_size > file_size - 8) {
+         fprintf(stderr, "safetensors_open: invalid header size\n");
+-        munmap(data, file_size);
++        iris_unmap(data, file_size);
+         return NULL;
+     }
+ 
+     safetensors_file_t *sf = calloc(1, sizeof(safetensors_file_t));
+     if (!sf) {
+-        munmap(data, file_size);
++        iris_unmap(data, file_size);
+         return NULL;
+     }
+ 
+@@ -294,7 +354,7 @@ safetensors_file_t *safetensors_open(const char *path) {
+ 
+ void safetensors_close(safetensors_file_t *sf) {
+     if (!sf) return;
+-    if (sf->data) munmap(sf->data, sf->file_size);
++    if (sf->data) iris_unmap(sf->data, sf->file_size);
+     free(sf->path);
+     free(sf->header_json);
+     free(sf);
+diff --git a/iris_transformer_flux.c b/iris_transformer_flux.c
+index 267fa5a..bc28bca 100644
+--- a/iris_transformer_flux.c
++++ b/iris_transformer_flux.c
+@@ -84,6 +84,11 @@ static double tf_get_time_ms(void) {
+ #endif
+ #include <pthread.h>
+ #include <unistd.h>
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>  /* GetSystemInfo: MinGW has unistd.h but not sysconf */
++#endif
+ #endif
+ 
+ /* Use Metal for GPU acceleration when available */
+@@ -337,7 +342,7 @@ static int parse_transformer_config(const char *model_dir, iris_transformer_flux
+     char path[1024];
+     snprintf(path, sizeof(path), "%s/transformer/config.json", model_dir);
+ 
+-    FILE *f = fopen(path, "r");
++    FILE *f = fopen(path, "rb");
+     if (!f) return -1;
+ 
+     char buf[4096];
+@@ -407,7 +412,7 @@ static int open_transformer_shards(const char *model_dir,
+     /* Try to read index JSON for sharded models */
+     snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors.index.json",
+              model_dir);
+-    FILE *fp = fopen(path, "r");
++    FILE *fp = fopen(path, "rb");
+     if (fp) {
+         fseek(fp, 0, SEEK_END);
+         long len = ftell(fp);
+@@ -1562,7 +1567,13 @@ static void *joint_attn_thread_worker(void *arg) {
+ static int get_attn_num_threads(int heads) {
+     static int cached = 0;
+     if (cached) return cached;
++#ifdef _WIN32
++    SYSTEM_INFO si;
++    GetSystemInfo(&si);
++    int ncpu = (int)si.dwNumberOfProcessors;
++#else
+     int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
++#endif
+     if (ncpu < 2) { cached = 1; return 1; }
+     if (ncpu > heads) ncpu = heads;
+     /* Round down to divide heads evenly */
+diff --git a/iris_transformer_zimage.c b/iris_transformer_zimage.c
+index ffdf7c1..1bf7df9 100644
+--- a/iris_transformer_zimage.c
++++ b/iris_transformer_zimage.c
+@@ -2193,7 +2193,7 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
+ 
+     /* Try index file first for sharded models */
+     snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors.index.json", model_dir);
+-    FILE *idx_f = fopen(path, "r");
++    FILE *idx_f = fopen(path, "rb");
+ 
+     safetensors_file_t *files[ZI_MAX_SHARDS] = {0};
+     int n_files = 0;
+diff --git a/main.c b/main.c
+index 82c23be..a03f50b 100644
+--- a/main.c
++++ b/main.c
+@@ -22,7 +22,9 @@
+ 
+ #include "iris.h"
+ #include "iris_kernels.h"
++#ifndef IRIS_NO_REPL
+ #include "iris_cli.h"
++#endif
+ #include "terminals.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -529,9 +531,19 @@ int main(int argc, char *argv[]) {
+ 
+     /* Interactive mode: start REPL */
+     if (interactive_mode) {
++#ifdef IRIS_NO_REPL
++        fprintf(stderr,
++            "Interactive mode is not available in this build.\n"
++            "Give a prompt and an output path instead, for example:\n"
++            "  %s -d %s -p \"a cat\" -o out.png\n",
++            argv[0], model_dir);
++        iris_free(ctx);
++        return 1;
++#else
+         int rc = iris_cli_run(ctx, model_dir);
+         iris_free(ctx);
+         return rc;
++#endif
+     }
+ 
+     /* Set up progress callbacks (for normal and verbose modes) */
+diff --git a/terminals.c b/terminals.c
+index 4cd2515..0ab34db 100644
+--- a/terminals.c
++++ b/terminals.c
+@@ -302,6 +302,12 @@ int iterm2_display_png(const char *path) {
+ int iterm2_display_image(const iris_image *img) {
+     if (!img || !img->data) return -1;
+ 
++#ifdef _WIN32
++    /* iTerm2 is macOS-only, so this protocol is never detected here, and
++     * MinGW has no mkstemps(). Fail instead of carrying a dead temp-file
++     * implementation that nothing on Windows can reach. */
++    return -1;
++#else
+     /* Create temp file for PNG */
+     char tmppath[] = "/tmp/iris_iterm_XXXXXX.png";
+     int fd = mkstemps(tmppath, 4);
+@@ -323,6 +329,7 @@ int iterm2_display_image(const iris_image *img) {
+     /* Clean up */
+     unlink(tmppath);
+     return result;
++#endif
+ }
+ 
+ /* ======================================================================
+-- 
+2.46.2.windows.1
+

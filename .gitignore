@@ -1,0 +1,15 @@
+# Generated images and their catalog: yours, not the project's
+images/
+
+# The engine, if you keep it inside this folder
+iris
+iris.exe
+iris.c/
+
+# Model weights, in case they end up here
+flux-klein-*/
+zimage-*/
+
+# Python
+__pycache__/
+*.pyc
